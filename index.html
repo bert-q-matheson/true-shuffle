@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>True Shuffle</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 34rem;
+         margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  button { font-size: 1rem; padding: .6rem 1.2rem; margin: .3rem .3rem .3rem 0;
+           cursor: pointer; }
+  button.big { font-size: 1.2rem; padding: .8rem 2rem; }
+  button:disabled { opacity: .5; cursor: default; }
+  select { font-size: 1rem; padding: .4rem; max-width: 100%; }
+  #status { margin-top: 1rem; padding: .6rem; border: 1px solid #8883;
+            border-radius: .4rem; min-height: 1.5em; white-space: pre-wrap; }
+  .row { margin: .8rem 0; }
+  .muted { opacity: .65; font-size: .9rem; }
+  code { font-size: .85em; }
+</style>
+</head>
+<body>
+<h1>True Shuffle</h1>
+<p class="muted">Fisher&ndash;Yates shuffles a Spotify playlist into a dedicated
+shuffle copy, bypassing Spotify's shuffle. Re-run any time to pick up new likes.</p>
+
+<div id="config-warning" class="row" hidden>
+  <strong>Setup needed:</strong> paste your Spotify client ID into
+  <code>CONFIG.clientId</code> at the top of this page's source.
+</div>
+
+<div id="auth-view" class="row" hidden>
+  <p>Redirect URI to register in your
+  <a href="https://developer.spotify.com/dashboard">Spotify app</a>:</p>
+  <p><code id="redirect-uri"></code></p>
+  <button id="connect-btn" class="big">Connect Spotify</button>
+</div>
+
+<div id="app-view" hidden>
+  <div class="row muted" id="user-line"></div>
+  <div class="row">
+    <label>Source playlist:
+      <select id="playlist-select"></select>
+    </label>
+  </div>
+  <div class="row muted" id="track-count"></div>
+  <div class="row">
+    <button id="shuffle-btn" class="big">Shuffle</button>
+    <button id="refresh-btn">Refresh track cache</button>
+    <button id="disconnect-btn">Disconnect</button>
+  </div>
+</div>
+
+<div id="status" role="status"></div>
+
+<script>
+'use strict';
+/* ============================== config ============================== */
+const CONFIG = {
+  clientId: "PASTE_YOUR_CLIENT_ID_HERE",   // <-- from developer.spotify.com
+  redirectUri: window.location.origin + window.location.pathname,
+  shuffleSuffix: " \u{1F500}",             // appended to source name: "Liked Songs 🔀"
+  cachePrefix: "trueshuffle:v1:",
+  tokenKey: "trueshuffle:tokens",
+  likedId: "__liked__",
+};
+
+/* ============================== tiny dom ============================== */
+const $ = (id) => document.getElementById(id);
+function setStatus(msg) { $("status").textContent = msg; }
+
+/* ============================== pkce ============================== */
+function randString(n) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const buf = new Uint32Array(n);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (x) => chars[x % chars.length]).join("");
+}
+async function sha256b64url(s) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const SCOPES = [
+  "playlist-read-private",
+  "user-library-read",
+  "playlist-modify-private",
+].join(" ");
+
+async function startLogin() {
+  const verifier = randString(96);
+  sessionStorage.setItem("trueshuffle:verifier", verifier);
+  const challenge = await sha256b64url(verifier);
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: CONFIG.clientId,
+    scope: SCOPES,
+    redirect_uri: CONFIG.redirectUri,
+    code_challenge_method: "S256",
+    code_challenge: challenge,
+  });
+  window.location.assign("https://accounts.spotify.com/authorize?" + params);
+}
+
+async function exchangeCode(code) {
+  const verifier = sessionStorage.getItem("trueshuffle:verifier") || "";
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: CONFIG.redirectUri,
+    client_id: CONFIG.clientId,
+    code_verifier: verifier,
+  });
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!r.ok) throw new Error("token exchange failed: HTTP " + r.status);
+  const t = await r.json();
+  saveTokens(t);
+  sessionStorage.removeItem("trueshuffle:verifier");
+}
+
+function saveTokens(t) {
+  localStorage.setItem(CONFIG.tokenKey, JSON.stringify({
+    access: t.access_token,
+    refresh: t.refresh_token || loadTokens()?.refresh || null,
+    expiresAt: Date.now() + (t.expires_in - 60) * 1000,
+  }));
+}
+function loadTokens() {
+  try { return JSON.parse(localStorage.getItem(CONFIG.tokenKey)); }
+  catch { return null; }
+}
+async function refreshTokens() {
+  const cur = loadTokens();
+  if (!cur?.refresh) throw new Error("no refresh token -- reconnect");
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: cur.refresh,
+    client_id: CONFIG.clientId,
+  });
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!r.ok) throw new Error("token refresh failed: HTTP " + r.status);
+  saveTokens(await r.json());
+}
+async function accessToken() {
+  let t = loadTokens();
+  if (!t) throw new Error("not connected");
+  if (Date.now() >= t.expiresAt) { await refreshTokens(); t = loadTokens(); }
+  return t.access;
+}
+
+/* ============================== spotify api ============================== */
+async function api(path, { method = "GET", body = null } = {}, retried = false) {
+  const token = await accessToken();
+  const r = await fetch("https://api.spotify.com/v1" + path, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + token,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (r.status === 401 && !retried) {
+    await refreshTokens();
+    return api(path, { method, body }, true);
+  }
+  if (r.status === 204) return null;
+  if (!r.ok) {
+    let detail = "";
+    try { detail = ": " + (await r.json()).error?.message; } catch {}
+    throw new Error(`Spotify API ${method} ${path} -> HTTP ${r.status}${detail}`);
+  }
+  return r.json();
+}
+async function apiAll(path, itemKey = "items") {
+  // follows `next` pagination; path must include limit=
+  let out = [];
+  let url = path;
+  for (;;) {
+    const page = await api(url);
+    out = out.concat(page[itemKey] || []);
+    if (!page.next) break;
+    url = page.next.replace("https://api.spotify.com/v1", "");
+  }
+  return out;
+}
+
+/* ============================== track cache ============================== */
+// localStorage entry: { kind: "snapshot"|"total", stamp, uris[], cachedAt }
+function cacheKey(sourceId) { return CONFIG.cachePrefix + "tracks:" + sourceId; }
+function readCache(sourceId) {
+  try { return JSON.parse(localStorage.getItem(cacheKey(sourceId))); }
+  catch { return null; }
+}
+function writeCache(sourceId, entry) {
+  try { localStorage.setItem(cacheKey(sourceId), JSON.stringify(entry)); }
+  catch { /* storage full/blocked: fall back to fetching every time */ }
+}
+
+async function fetchSourceTracks(sourceId, onProgress) {
+  // returns { uris[], stamp, kind } where stamp proves freshness
+  let uris, kind, stamp;
+  if (sourceId === CONFIG.likedId) {
+    kind = "total";
+    const first = await api("/me/tracks?limit=1");
+    stamp = first.total;
+    const items = await apiAll("/me/tracks?limit=50");
+    uris = items
+      .map((it) => it.track)
+      .filter((t) => t?.uri && t.is_playable !== false)
+      .map((t) => t.uri);
+  } else {
+    kind = "snapshot";
+    const meta = await api(`/playlists/${sourceId}?fields=snapshot_id`);
+    stamp = meta.snapshot_id;
+    const items = await apiAll(`/playlists/${sourceId}/tracks?limit=100&fields=items(track(uri)),next`);
+    uris = items.map((it) => it.track?.uri).filter(Boolean);
+  }
+  if (onProgress) onProgress(uris.length);
+  return { uris, kind, stamp };
+}
+
+async function getTrackUris(sourceId, { force = false } = {}) {
+  const key = cacheKey(sourceId);
+  if (!force) {
+    const cached = readCache(sourceId);
+    if (cached?.uris?.length) {
+      let fresh = false;
+      try {
+        if (cached.kind === "snapshot") {
+          const meta = await api(`/playlists/${sourceId}?fields=snapshot_id`);
+          fresh = meta.snapshot_id === cached.stamp;
+        } else {
+          const one = await api("/me/tracks?limit=1");
+          fresh = one.total === cached.stamp;
+        }
+      } catch { fresh = false; }
+      if (fresh) return { uris: cached.uris, cached: true };
+    }
+  }
+  const { uris, kind, stamp } = await fetchSourceTracks(sourceId);
+  writeCache(sourceId, { kind, stamp, uris, cachedAt: Date.now() });
+  return { uris, cached: false };
+}
+
+/* ============================== shuffle ============================== */
+function fisherYates(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const j = buf[0] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function findPlaylistByName(name) {
+  const pls = await apiAll("/me/playlists?limit=50");
+  return pls.find((p) => p.name === name) || null;
+}
+
+async function doShuffle() {
+  const sel = $("playlist-select");
+  const sourceId = sel.value;
+  const sourceName = sel.options[sel.selectedIndex].dataset.name;
+  const targetName = sourceName + CONFIG.shuffleSuffix;
+  const btn = $("shuffle-btn");
+  btn.disabled = true;
+  try {
+    setStatus("Loading track list…");
+    const { uris, cached } = await getTrackUris(sourceId);
+    setStatus(`Shuffling ${uris.length} tracks${cached ? " (from cache)" : ""}…`);
+    // yield so the status paints before the (fast) shuffle + slow writes
+    await new Promise((r) => setTimeout(r, 30));
+    const shuffledUris = fisherYates(uris);
+
+    setStatus("Finding/creating target playlist…");
+    let target = await findPlaylistByName(targetName);
+    if (!target) {
+      const me = await api("/me");
+      target = await api(`/users/${encodeURIComponent(me.id)}/playlists`, {
+        method: "POST",
+        body: {
+          name: targetName,
+          public: false,
+          description: `True Shuffle of "${sourceName}" — re-shuffle any time to pick up changes.`,
+        },
+      });
+    }
+
+    if (shuffledUris.length === 0) throw new Error("no tracks to write");
+    setStatus(`Writing ${shuffledUris.length} tracks to "${targetName}"…`);
+    // PUT replaces the whole playlist (max 100); POST appends the rest.
+    const first = shuffledUris.slice(0, 100);
+    await api(`/playlists/${target.id}/tracks`, {
+      method: "PUT", body: { uris: first },
+    });
+    for (let i = 100; i < shuffledUris.length; i += 100) {
+      await api(`/playlists/${target.id}/tracks`, {
+        method: "POST", body: { uris: shuffledUris.slice(i, i + 100) },
+      });
+      setStatus(`Writing… ${Math.min(i + 100, shuffledUris.length)}/${shuffledUris.length}`);
+    }
+    setStatus(`Done — "${targetName}" has ${shuffledUris.length} tracks in fresh random order.\nPlay it in Spotify with shuffle OFF.`);
+  } catch (e) {
+    setStatus("Error: " + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ============================== ui wiring ============================== */
+async function loadPlaylists() {
+  const sel = $("playlist-select");
+  sel.innerHTML = "";
+  const opt = document.createElement("option");
+  opt.value = CONFIG.likedId;
+  opt.textContent = "Liked Songs";
+  opt.dataset.name = "Liked Songs";
+  sel.appendChild(opt);
+  const pls = await apiAll("/me/playlists?limit=50");
+  for (const p of pls) {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = `${p.name} (${p.tracks.total})`;
+    o.dataset.name = p.name;
+    sel.appendChild(o);
+  }
+}
+
+async function refreshCount() {
+  const sourceId = $("playlist-select").value;
+  const cached = readCache(sourceId);
+  $("track-count").textContent = cached?.uris?.length
+    ? `${cached.uris.length} tracks cached`
+    : "track list not cached yet";
+}
+
+async function boot() {
+  $("redirect-uri").textContent = CONFIG.redirectUri;
+  if (CONFIG.clientId === "PASTE_YOUR_CLIENT_ID_HERE") {
+    $("config-warning").hidden = false;
+    return;
+  }
+  // OAuth callback?
+  const q = new URLSearchParams(window.location.search);
+  if (q.get("code")) {
+    try {
+      await exchangeCode(q.get("code"));
+    } catch (e) {
+      setStatus("Login failed: " + e.message);
+    }
+    window.history.replaceState({}, "", CONFIG.redirectUri);
+  }
+  if (!loadTokens()) {
+    $("auth-view").hidden = false;
+    return;
+  }
+  $("app-view").hidden = false;
+  try {
+    const me = await api("/me");
+    $("user-line").textContent = `Signed in as ${me.display_name || me.id}`;
+    await loadPlaylists();
+    await refreshCount();
+  } catch (e) {
+    setStatus("Error: " + e.message + " — try Disconnect and reconnect.");
+  }
+}
+
+$("connect-btn").addEventListener("click", () => {
+  startLogin().catch((e) => setStatus("Error: " + e.message));
+});
+$("shuffle-btn").addEventListener("click", () => {
+  doShuffle().catch((e) => setStatus("Error: " + (e?.message || e)));
+});
+$("refresh-btn").addEventListener("click", async () => {
+  try {
+    localStorage.removeItem(cacheKey($("playlist-select").value));
+    const { uris } = await getTrackUris($("playlist-select").value, { force: true });
+    setStatus(`Cache refreshed: ${uris.length} tracks.`);
+    await refreshCount();
+  } catch (e) { setStatus("Error: " + (e?.message || e)); }
+});
+$("disconnect-btn").addEventListener("click", () => {
+  localStorage.removeItem(CONFIG.tokenKey);
+  window.location.reload();
+});
+$("playlist-select").addEventListener("change", refreshCount);
+
+boot().catch((e) => setStatus("Error: " + (e?.message || e)));
+</script>
+</body>
+</html>
