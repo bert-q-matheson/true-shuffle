@@ -220,11 +220,25 @@ async function fetchSourceTracks(sourceId, onProgress) {
       .filter((t) => t?.uri && t.is_playable !== false)
       .map((t) => t.uri);
   } else {
+    // Feb-2026 API: /playlists/{id}/tracks -> /playlists/{id}/items,
+    // response entries carry `item` (was `track`); readable only for
+    // playlists the user owns or collaborates on.
     kind = "snapshot";
     const meta = await api(`/playlists/${sourceId}?fields=snapshot_id`);
     stamp = meta.snapshot_id;
-    const items = await apiAll(`/playlists/${sourceId}/tracks?limit=100&fields=items(track(uri)),next`);
-    uris = items.map((it) => it.track?.uri).filter(Boolean);
+    let items;
+    try {
+      items = await apiAll(`/playlists/${sourceId}/items?limit=50&fields=items(item(uri,is_playable)),next`);
+    } catch (e) {
+      if (/HTTP 403/.test(e.message)) {
+        throw new Error("Spotify only lets apps read playlists you own or collaborate on — this one isn't readable.");
+      }
+      throw e;
+    }
+    uris = items
+      .map((it) => (it.item && typeof it.item === "object" ? it.item : it.track))
+      .filter((t) => t && typeof t === "object" && t.uri && t.is_playable !== false)
+      .map((t) => t.uri);
   }
   if (onProgress) onProgress(uris.length);
   return { uris, kind, stamp };
@@ -288,8 +302,8 @@ async function doShuffle() {
     setStatus("Finding/creating target playlist…");
     let target = await findPlaylistByName(targetName);
     if (!target) {
-      const me = await api("/me");
-      target = await api(`/users/${encodeURIComponent(me.id)}/playlists`, {
+      // Feb-2026 API: POST /users/{id}/playlists -> POST /me/playlists
+      target = await api("/me/playlists", {
         method: "POST",
         body: {
           name: targetName,
@@ -301,13 +315,14 @@ async function doShuffle() {
 
     if (shuffledUris.length === 0) throw new Error("no tracks to write");
     setStatus(`Writing ${shuffledUris.length} tracks to "${targetName}"…`);
+    // Feb-2026 API: /playlists/{id}/tracks -> /playlists/{id}/items.
     // PUT replaces the whole playlist (max 100); POST appends the rest.
     const first = shuffledUris.slice(0, 100);
-    await api(`/playlists/${target.id}/tracks`, {
+    await api(`/playlists/${target.id}/items`, {
       method: "PUT", body: { uris: first },
     });
     for (let i = 100; i < shuffledUris.length; i += 100) {
-      await api(`/playlists/${target.id}/tracks`, {
+      await api(`/playlists/${target.id}/items`, {
         method: "POST", body: { uris: shuffledUris.slice(i, i + 100) },
       });
       setStatus(`Writing… ${Math.min(i + 100, shuffledUris.length)}/${shuffledUris.length}`);
@@ -339,9 +354,9 @@ async function loadPlaylists() {
     }
     const o = document.createElement("option");
     o.value = p.id;
-    // Some playlist objects come back without the tracks summary; still usable
-    // as a shuffle source (track fetch hits the playlist endpoint directly).
-    const n = p.tracks?.total;
+    // Feb-2026 API: playlist `tracks` summary renamed to `items`; absent
+    // entirely for followed playlists (only metadata is returned).
+    const n = p.items?.total;
     o.textContent = (typeof n === "number") ? `${p.name} (${n})` : p.name;
     o.dataset.name = p.name;
     sel.appendChild(o);
