@@ -330,13 +330,23 @@ async function loadPlaylists() {
   opt.dataset.name = "Liked Songs";
   sel.appendChild(opt);
   const pls = await apiAll("/me/playlists?limit=50");
+  let skipped = 0;
   for (const p of pls) {
+    if (!p || typeof p !== "object" || !p.id || !p.name) {
+      skipped++;
+      console.warn("True Shuffle: skipping malformed playlist entry", p);
+      continue;
+    }
     const o = document.createElement("option");
     o.value = p.id;
-    o.textContent = `${p.name} (${p.tracks.total})`;
+    // Some playlist objects come back without the tracks summary; still usable
+    // as a shuffle source (track fetch hits the playlist endpoint directly).
+    const n = p.tracks?.total;
+    o.textContent = (typeof n === "number") ? `${p.name} (${n})` : p.name;
     o.dataset.name = p.name;
     sel.appendChild(o);
   }
+  if (skipped) console.warn(`True Shuffle: skipped ${skipped} malformed entries`);
 }
 
 async function refreshCount() {
